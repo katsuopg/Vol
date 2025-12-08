@@ -9,77 +9,230 @@ indicator("Absorption Detector", shorttitle="AbsDetect", overlay=true)
 // =============================================================================
 
 // Volume Settings
-volumeSpikeMultiplier = input.float(3.0, title="Volume Spike Multiplier", minval=1.0, step=0.1,
-    tooltip="Volume must exceed average by this multiple to be considered a spike")
+volumeSpikeMultiplier = input.float(3.0, title="Volume Spike Multiplier (Weak)", minval=1.0, step=0.1,
+    tooltip="Minimum volume multiplier for weak absorption signal", group="Volume Settings")
+volumeSpikeMedium = input.float(5.0, title="Volume Spike Multiplier (Medium)", minval=1.0, step=0.1,
+    tooltip="Volume multiplier threshold for medium absorption signal", group="Volume Settings")
+volumeSpikeStrong = input.float(8.0, title="Volume Spike Multiplier (Strong)", minval=1.0, step=0.1,
+    tooltip="Volume multiplier threshold for strong absorption signal", group="Volume Settings")
 volumeSmaLength = input.int(20, title="Volume SMA Length", minval=1,
-    tooltip="Period for calculating average volume")
+    tooltip="Period for calculating average volume", group="Volume Settings")
 
 // Price Settings
 priceChangeThreshold = input.float(0.2, title="Price Change Threshold (%)", minval=0.01, step=0.01,
-    tooltip="Maximum body size as percentage of open price to be considered flat")
+    tooltip="Maximum body size as percentage of open price to be considered flat", group="Price Settings")
 
-// Buy Pressure Settings
-buyPressureRatio = input.float(1.5, title="Buy Pressure Ratio", minval=1.0, step=0.1,
-    tooltip="Buy volume must exceed sell volume by this ratio for buy-side absorption")
+// Pressure Ratio Settings
+pressureRatio = input.float(1.5, title="Pressure Ratio", minval=1.0, step=0.1,
+    tooltip="Buy/Sell volume ratio threshold for absorption detection", group="Pressure Settings")
 
 // Display Settings
 showSignals = input.bool(true, title="Show Signals",
-    tooltip="Toggle visibility of absorption signals on chart")
+    tooltip="Toggle visibility of absorption signals on chart", group="Display")
+showBackground = input.bool(true, title="Show Background Highlight",
+    tooltip="Toggle background color on absorption bars", group="Display")
+
+// Alert Settings
 alertEnabled = input.bool(false, title="Alert Enabled",
-    tooltip="Enable alert notifications for absorption signals")
+    tooltip="Enable alert notifications for absorption signals", group="Alerts")
+
+// =============================================================================
+// COLOR SETTINGS
+// =============================================================================
+
+// Buy Absorption Colors (Green gradient)
+colorBuyWeak = input.color(color.new(#4CAF50, 60), title="Buy Weak", group="Colors - Buy Absorption")
+colorBuyMedium = input.color(color.new(#2E7D32, 30), title="Buy Medium", group="Colors - Buy Absorption")
+colorBuyStrong = input.color(color.new(#1B5E20, 0), title="Buy Strong", group="Colors - Buy Absorption")
+
+// Sell Absorption Colors (Red gradient)
+colorSellWeak = input.color(color.new(#F44336, 60), title="Sell Weak", group="Colors - Sell Absorption")
+colorSellMedium = input.color(color.new(#C62828, 30), title="Sell Medium", group="Colors - Sell Absorption")
+colorSellStrong = input.color(color.new(#B71C1C, 0), title="Sell Strong", group="Colors - Sell Absorption")
 
 // =============================================================================
 // CALCULATIONS
 // =============================================================================
 
-// 4.1 Volume Spike Detection
+// Volume Analysis
 volAvg = ta.sma(volume, volumeSmaLength)
-volSpike = volume > volAvg * volumeSpikeMultiplier
+volRatio = volume / volAvg
 
-// 4.2 Price Flat Detection (horizontal price movement)
+// Volume Spike Levels
+volSpikeWeak = volRatio >= volumeSpikeMultiplier
+volSpikeMedium = volRatio >= volumeSpikeMedium
+volSpikeStrong = volRatio >= volumeSpikeStrong
+
+// Price Flat Detection (horizontal price movement)
 priceChangePct = math.abs(close - open) / open * 100
 priceFlat = priceChangePct < priceChangeThreshold
 
-// 4.3 Buy Flow Dominance Detection
-// Using price position within bar to estimate buy/sell volume
-// Buy volume: portion of volume attributed to buying pressure (close near high = more buying)
-// Sell volume: portion of volume attributed to selling pressure (close near low = more selling)
-barRange = high - low + 1e-6  // Add small value to prevent division by zero
+// Buy/Sell Volume Estimation
+// Using price position within bar to estimate buy/sell pressure
+barRange = high - low + 1e-6  // Prevent division by zero
 buyVol = volume * ((close - low) / barRange)
 sellVol = volume - buyVol
-buyDominant = buyVol > sellVol * buyPressureRatio
 
-// 4.4 Absorption Signal - All conditions must be met
-// Skip bars with zero volume
+// Dominance Detection
+buyDominant = buyVol > sellVol * pressureRatio
+sellDominant = sellVol > buyVol * pressureRatio
+
+// Valid bar check (skip zero volume bars)
 validBar = volume > 0
-absorption = volSpike and priceFlat and buyDominant and validBar
 
 // =============================================================================
-// OUTPUTS
+// ABSORPTION SIGNALS
 // =============================================================================
 
-// 5.1 Signal Visualization
-plotshape(showSignals and absorption,
-    title="Absorption Signal",
+// Buy Absorption (bullish accumulation)
+buyAbsorptionWeak = volSpikeWeak and priceFlat and buyDominant and validBar
+buyAbsorptionMedium = volSpikeMedium and priceFlat and buyDominant and validBar
+buyAbsorptionStrong = volSpikeStrong and priceFlat and buyDominant and validBar
+
+// Sell Absorption (bearish distribution)
+sellAbsorptionWeak = volSpikeWeak and priceFlat and sellDominant and validBar
+sellAbsorptionMedium = volSpikeMedium and priceFlat and sellDominant and validBar
+sellAbsorptionStrong = volSpikeStrong and priceFlat and sellDominant and validBar
+
+// Combined signals (any level)
+buyAbsorption = buyAbsorptionWeak
+sellAbsorption = sellAbsorptionWeak
+
+// =============================================================================
+// SIGNAL STRENGTH DETERMINATION
+// =============================================================================
+
+// Determine signal strength level (3=strong, 2=medium, 1=weak, 0=none)
+buyStrength = buyAbsorptionStrong ? 3 : buyAbsorptionMedium ? 2 : buyAbsorptionWeak ? 1 : 0
+sellStrength = sellAbsorptionStrong ? 3 : sellAbsorptionMedium ? 2 : sellAbsorptionWeak ? 1 : 0
+
+// Get appropriate color based on strength
+getBuyColor(strength) =>
+    strength == 3 ? colorBuyStrong : strength == 2 ? colorBuyMedium : colorBuyWeak
+
+getSellColor(strength) =>
+    strength == 3 ? colorSellStrong : strength == 2 ? colorSellMedium : colorSellWeak
+
+buySignalColor = getBuyColor(buyStrength)
+sellSignalColor = getSellColor(sellStrength)
+
+// =============================================================================
+// OUTPUTS - SIGNAL VISUALIZATION
+// =============================================================================
+
+// Buy Absorption Signals (triangles below bar)
+plotshape(showSignals and buyAbsorptionStrong,
+    title="Buy Absorption Strong",
     style=shape.triangleup,
     location=location.belowbar,
-    color=color.green,
+    color=colorBuyStrong,
+    size=size.normal,
+    text="Abs")
+
+plotshape(showSignals and buyAbsorptionMedium and not buyAbsorptionStrong,
+    title="Buy Absorption Medium",
+    style=shape.triangleup,
+    location=location.belowbar,
+    color=colorBuyMedium,
     size=size.small,
     text="Abs")
 
-// 5.2 Alert Condition
-alertcondition(alertEnabled and absorption,
-    title="Absorption Detected",
-    message="Absorption Signal Detected - Volume spike with flat price and buy-side dominance")
+plotshape(showSignals and buyAbsorptionWeak and not buyAbsorptionMedium,
+    title="Buy Absorption Weak",
+    style=shape.triangleup,
+    location=location.belowbar,
+    color=colorBuyWeak,
+    size=size.tiny,
+    text="Abs")
+
+// Sell Absorption Signals (triangles above bar)
+plotshape(showSignals and sellAbsorptionStrong,
+    title="Sell Absorption Strong",
+    style=shape.triangledown,
+    location=location.abovebar,
+    color=colorSellStrong,
+    size=size.normal,
+    text="Abs")
+
+plotshape(showSignals and sellAbsorptionMedium and not sellAbsorptionStrong,
+    title="Sell Absorption Medium",
+    style=shape.triangledown,
+    location=location.abovebar,
+    color=colorSellMedium,
+    size=size.small,
+    text="Abs")
+
+plotshape(showSignals and sellAbsorptionWeak and not sellAbsorptionMedium,
+    title="Sell Absorption Weak",
+    style=shape.triangledown,
+    location=location.abovebar,
+    color=colorSellWeak,
+    size=size.tiny,
+    text="Abs")
 
 // =============================================================================
-// DEBUG / INFO PANEL (optional - can be enabled for analysis)
+// OUTPUTS - BACKGROUND HIGHLIGHT
 // =============================================================================
 
-// Background highlight for absorption bars (subtle visual cue)
-bgcolor(absorption ? color.new(color.green, 90) : na, title="Absorption Background")
+// Background colors with strength-based opacity
+bgBuyColor = buyAbsorptionStrong ? color.new(colorBuyStrong, 85) :
+             buyAbsorptionMedium ? color.new(colorBuyMedium, 90) :
+             buyAbsorptionWeak ? color.new(colorBuyWeak, 93) : na
 
-// Plot volume ratio for reference (in separate pane if needed)
-// Uncomment below lines to see volume analysis in a separate indicator pane
-// plot(volume / volAvg, title="Volume Ratio", color=color.blue)
-// hline(volumeSpikeMultiplier, title="Spike Threshold", color=color.gray, linestyle=hline.style_dashed)
+bgSellColor = sellAbsorptionStrong ? color.new(colorSellStrong, 85) :
+              sellAbsorptionMedium ? color.new(colorSellMedium, 90) :
+              sellAbsorptionWeak ? color.new(colorSellWeak, 93) : na
+
+bgcolor(showBackground and buyAbsorption ? bgBuyColor : na, title="Buy Absorption Background")
+bgcolor(showBackground and sellAbsorption ? bgSellColor : na, title="Sell Absorption Background")
+
+// =============================================================================
+// OUTPUTS - ALERTS (Bar Close Only)
+// =============================================================================
+
+// Buy Absorption Alerts
+alertcondition(buyAbsorptionWeak,
+    title="Buy Absorption (Any)",
+    message="Buy Absorption Detected - Bullish accumulation signal")
+
+alertcondition(buyAbsorptionMedium,
+    title="Buy Absorption (Medium+)",
+    message="Medium Buy Absorption Detected - Significant bullish accumulation")
+
+alertcondition(buyAbsorptionStrong,
+    title="Buy Absorption (Strong)",
+    message="Strong Buy Absorption Detected - Major bullish accumulation!")
+
+// Sell Absorption Alerts
+alertcondition(sellAbsorptionWeak,
+    title="Sell Absorption (Any)",
+    message="Sell Absorption Detected - Bearish distribution signal")
+
+alertcondition(sellAbsorptionMedium,
+    title="Sell Absorption (Medium+)",
+    message="Medium Sell Absorption Detected - Significant bearish distribution")
+
+alertcondition(sellAbsorptionStrong,
+    title="Sell Absorption (Strong)",
+    message="Strong Sell Absorption Detected - Major bearish distribution!")
+
+// Combined Alert
+alertcondition(buyAbsorption or sellAbsorption,
+    title="Any Absorption",
+    message="Absorption Signal Detected")
+
+// =============================================================================
+// INFO TABLE (Optional - Shows current status)
+// =============================================================================
+
+var table infoTable = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80))
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Vol Ratio", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, str.tostring(volRatio, "#.##") + "x", text_color=color.yellow, text_size=size.small)
+    table.cell(infoTable, 0, 1, "Buy Vol %", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 1, str.tostring(buyVol / volume * 100, "#.#") + "%", text_color=color.green, text_size=size.small)
+    table.cell(infoTable, 0, 2, "Sell Vol %", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(sellVol / volume * 100, "#.#") + "%", text_color=color.red, text_size=size.small)
+    table.cell(infoTable, 0, 3, "Price Chg", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 3, str.tostring(priceChangePct, "#.##") + "%", text_color=color.white, text_size=size.small)
