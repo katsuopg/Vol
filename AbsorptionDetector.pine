@@ -1,0 +1,245 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Vol Project
+
+//@version=6
+indicator(
+    title = "Absorption Detector v2",
+    shorttitle = "AbsDetect",
+    overlay = true,
+    max_labels_count = 500
+)
+
+// ————— Constants
+color BULL_ABS_COLOR = color.new(color.green, 0)
+color BEAR_ABS_COLOR = color.new(color.red, 0)
+color BULL_BREAKOUT_COLOR = color.new(color.lime, 0)
+color BEAR_BREAKOUT_COLOR = color.new(color.fuchsia, 0)
+float EPSILON = 1e-6
+
+// ————— Inputs
+string GROUP_VOLUME = "出来高設定"
+float volSpikeMultInput = input.float(2.0, "Volume Spike Multiplier", minval = 1.0, step = 0.1, group = GROUP_VOLUME, tooltip = "出来高が平均の何倍でスパイクと判定するか")
+int volSmaLengthInput = input.int(20, "Volume SMA Length", minval = 1, group = GROUP_VOLUME, tooltip = "出来高平均の算出期間")
+
+string GROUP_PRICE = "価格設定"
+float priceThresholdInput = input.float(0.3, "Price Change Threshold (%)", minval = 0.0, step = 0.05, group = GROUP_PRICE, tooltip = "実体がこの％以内なら横ばいと判定")
+float atrMultInput = input.float(0.5, "ATR Multiplier for Flat", minval = 0.1, step = 0.1, group = GROUP_PRICE, tooltip = "ATRの何倍以内を横ばいとするか（0で無効）")
+bool useAtrThresholdInput = input.bool(true, "Use ATR-based Threshold", group = GROUP_PRICE, tooltip = "固定%ではなくATRベースで横ばい判定")
+
+string GROUP_FLOW = "フロー設定"
+float buyPressureRatioInput = input.float(1.3, "Buy Pressure Ratio", minval = 1.0, step = 0.1, group = GROUP_FLOW, tooltip = "買いフローが売りフローの何倍で優位と判定")
+
+string GROUP_TREND = "トレンドフィルター"
+bool useTrendFilterInput = input.bool(true, "Use Trend Filter", group = GROUP_TREND, tooltip = "トレンド方向と一致する吸収のみ表示")
+int trendEmaLengthInput = input.int(50, "Trend EMA Length", minval = 1, group = GROUP_TREND, tooltip = "トレンド判定用EMAの期間")
+
+string GROUP_CONFIRM = "確認設定"
+int consecutiveBarsInput = input.int(1, "Min Consecutive Bars", minval = 1, maxval = 5, group = GROUP_CONFIRM, tooltip = "連続して吸収条件を満たすバー数")
+bool useBreakoutConfirmInput = input.bool(true, "Require Breakout Confirm", group = GROUP_CONFIRM, tooltip = "ブレイクアウトで確定シグナルを出す")
+int breakoutLookbackInput = input.int(5, "Breakout Lookback", minval = 1, maxval = 20, group = GROUP_CONFIRM, tooltip = "吸収後何本以内のブレイクアウトを検出するか")
+float breakoutAtrMultInput = input.float(1.0, "Breakout ATR Mult", minval = 0.5, step = 0.1, group = GROUP_CONFIRM, tooltip = "ブレイクアウト判定のATR倍率")
+
+string GROUP_DISPLAY = "表示設定"
+bool showBullSignalInput = input.bool(true, "Show Buy Absorption", group = GROUP_DISPLAY)
+bool showBearSignalInput = input.bool(true, "Show Sell Absorption", group = GROUP_DISPLAY)
+bool showPreliminaryInput = input.bool(true, "Show Preliminary Signals", group = GROUP_DISPLAY, tooltip = "ブレイクアウト前の予備シグナルを表示")
+bool showDebugInput = input.bool(false, "Show Debug Info", group = GROUP_DISPLAY, tooltip = "デバッグ用の詳細情報を表示")
+
+string GROUP_ALERT = "アラート設定"
+bool alertEnabledInput = input.bool(false, "Alert Enabled", group = GROUP_ALERT)
+
+// ————— Functions
+// @function 買い出来高を推定（Close-Low比率方式）
+// @param vol (float) 出来高
+// @param h (float) 高値
+// @param l (float) 安値
+// @param c (float) 終値
+// @returns 推定買い出来高
+estimateBuyVolume(float vol, float h, float l, float c) =>
+    float priceRange = h - l + EPSILON
+    float buyRatio = (c - l) / priceRange
+    vol * buyRatio
+
+// @function N本連続で条件を満たしているかチェック
+// @param condition (bool) 判定条件
+// @param n (int) 連続本数
+// @returns 連続条件を満たしているか
+consecutiveTrue(bool condition, int n) =>
+    bool result = true
+    for i = 0 to n - 1
+        if not condition[i]
+            result := false
+            break
+    result
+
+// ————— Calculations
+// 出来高がゼロのバーは除外
+bool validBar = volume > 0
+
+// ATR計算
+float atrValue = ta.atr(14)
+
+// トレンド判定
+float trendEma = ta.ema(close, trendEmaLengthInput)
+bool upTrend = close > trendEma
+bool downTrend = close < trendEma
+
+// 4.1 出来高スパイク判定
+float volAvg = ta.sma(volume, volSmaLengthInput)
+bool volSpike = validBar and volume > volAvg * volSpikeMultInput
+
+// 4.2 価格横ばい判定（ATRベースまたは固定%）
+float priceChangePct = math.abs(close - open) / (open + EPSILON) * 100
+float priceChangeAbs = math.abs(close - open)
+bool priceFlatByPct = priceChangePct < priceThresholdInput
+bool priceFlatByAtr = priceChangeAbs < atrValue * atrMultInput
+bool priceFlat = useAtrThresholdInput ? priceFlatByAtr : priceFlatByPct
+
+// 4.3 フロー優位性判定
+float buyVol = estimateBuyVolume(volume, high, low, close)
+float sellVol = volume - buyVol
+bool buyDominant = buyVol > sellVol * buyPressureRatioInput
+bool sellDominant = sellVol > buyVol * buyPressureRatioInput
+
+// 4.4 基本吸収条件
+bool baseBullAbsorption = volSpike and priceFlat and buyDominant
+bool baseBearAbsorption = volSpike and priceFlat and sellDominant
+
+// 4.5 トレンドフィルター適用
+bool trendFilteredBull = useTrendFilterInput ? (baseBullAbsorption and upTrend) : baseBullAbsorption
+bool trendFilteredBear = useTrendFilterInput ? (baseBearAbsorption and downTrend) : baseBearAbsorption
+
+// 4.6 連続性チェック
+bool consecutiveBull = consecutiveBarsInput > 1 ? consecutiveTrue(trendFilteredBull, consecutiveBarsInput) : trendFilteredBull
+bool consecutiveBear = consecutiveBarsInput > 1 ? consecutiveTrue(trendFilteredBear, consecutiveBarsInput) : trendFilteredBear
+
+// 4.7 吸収状態の記録（ブレイクアウト検出用）
+var int barsSinceBullAbs = 999
+var int barsSinceBearAbs = 999
+
+if consecutiveBull
+    barsSinceBullAbs := 0
+else
+    barsSinceBullAbs := barsSinceBullAbs + 1
+
+if consecutiveBear
+    barsSinceBearAbs := 0
+else
+    barsSinceBearAbs := barsSinceBearAbs + 1
+
+// 4.8 ブレイクアウト検出
+float breakoutThreshold = atrValue * breakoutAtrMultInput
+bool bullBreakout = close > open and (close - open) > breakoutThreshold
+bool bearBreakout = close < open and (open - close) > breakoutThreshold
+
+// 吸収後のブレイクアウト確認
+bool confirmedBullBreakout = bullBreakout and barsSinceBullAbs > 0 and barsSinceBullAbs <= breakoutLookbackInput
+bool confirmedBearBreakout = bearBreakout and barsSinceBearAbs > 0 and barsSinceBearAbs <= breakoutLookbackInput
+
+// 最終シグナル
+bool preliminaryBullSignal = consecutiveBull
+bool preliminaryBearSignal = consecutiveBear
+bool confirmedBullSignal = useBreakoutConfirmInput ? confirmedBullBreakout : consecutiveBull
+bool confirmedBearSignal = useBreakoutConfirmInput ? confirmedBearBreakout : consecutiveBear
+
+// ————— Debug Info
+var table debugTable = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 80))
+if showDebugInput and barstate.islast
+    table.cell(debugTable, 0, 0, "Volume", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 0, str.tostring(volume, format.volume), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 0, 1, "Vol Ratio", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 1, str.tostring(volume / volAvg, "#.##") + "x", text_color = volSpike ? color.lime : color.white, text_size = size.small)
+    table.cell(debugTable, 0, 2, "Price Chg", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 2, str.tostring(priceChangeAbs, "#.####"), text_color = priceFlat ? color.lime : color.white, text_size = size.small)
+    table.cell(debugTable, 0, 3, "ATR", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 3, str.tostring(atrValue, "#.####"), text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 0, 4, "Buy/Sell", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 4, str.tostring(buyVol / (sellVol + EPSILON), "#.##") + "x", text_color = buyDominant ? color.lime : (sellDominant ? color.red : color.white), text_size = size.small)
+    table.cell(debugTable, 0, 5, "Trend", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 5, upTrend ? "UP" : "DOWN", text_color = upTrend ? color.lime : color.red, text_size = size.small)
+    table.cell(debugTable, 0, 6, "Bull Abs", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 6, str.tostring(barsSinceBullAbs) + " bars ago", text_color = barsSinceBullAbs <= breakoutLookbackInput ? color.lime : color.gray, text_size = size.small)
+    table.cell(debugTable, 0, 7, "Bear Abs", text_color = color.white, text_size = size.small)
+    table.cell(debugTable, 1, 7, str.tostring(barsSinceBearAbs) + " bars ago", text_color = barsSinceBearAbs <= breakoutLookbackInput ? color.red : color.gray, text_size = size.small)
+
+// ————— Visuals
+// 予備シグナル（小さいマーカー）
+plotshape(
+    showBullSignalInput and showPreliminaryInput and preliminaryBullSignal and not confirmedBullSignal,
+    title = "Preliminary Buy Absorption",
+    style = shape.circle,
+    location = location.belowbar,
+    color = color.new(BULL_ABS_COLOR, 50),
+    size = size.tiny
+)
+
+plotshape(
+    showBearSignalInput and showPreliminaryInput and preliminaryBearSignal and not confirmedBearSignal,
+    title = "Preliminary Sell Absorption",
+    style = shape.circle,
+    location = location.abovebar,
+    color = color.new(BEAR_ABS_COLOR, 50),
+    size = size.tiny
+)
+
+// 確定シグナル（ブレイクアウト確認後）
+plotshape(
+    showBullSignalInput and confirmedBullSignal,
+    title = "Confirmed Buy Absorption",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = BULL_BREAKOUT_COLOR,
+    size = size.small,
+    text = "BUY",
+    textcolor = BULL_BREAKOUT_COLOR
+)
+
+plotshape(
+    showBearSignalInput and confirmedBearSignal,
+    title = "Confirmed Sell Absorption",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = BEAR_BREAKOUT_COLOR,
+    size = size.small,
+    text = "SELL",
+    textcolor = BEAR_BREAKOUT_COLOR
+)
+
+// トレンドEMA表示
+plot(useTrendFilterInput ? trendEma : na, "Trend EMA", color = color.new(color.orange, 50), linewidth = 1)
+
+// 吸収ゾーン背景
+bgcolor(preliminaryBullSignal ? color.new(color.green, 90) : (preliminaryBearSignal ? color.new(color.red, 90) : na), title = "Absorption Zone")
+
+// ————— Alerts
+alertcondition(
+    confirmedBullSignal,
+    title = "Confirmed Buy Signal",
+    message = "買いシグナル確定: {{ticker}} {{interval}}"
+)
+
+alertcondition(
+    confirmedBearSignal,
+    title = "Confirmed Sell Signal",
+    message = "売りシグナル確定: {{ticker}} {{interval}}"
+)
+
+alertcondition(
+    preliminaryBullSignal,
+    title = "Preliminary Buy Absorption",
+    message = "買い吸収検出（予備）: {{ticker}} {{interval}}"
+)
+
+alertcondition(
+    preliminaryBearSignal,
+    title = "Preliminary Sell Absorption",
+    message = "売り吸収検出（予備）: {{ticker}} {{interval}}"
+)
+
+// リアルタイムアラート
+if alertEnabledInput and confirmedBullSignal
+    alert("買いシグナル確定", alert.freq_once_per_bar_close)
+
+if alertEnabledInput and confirmedBearSignal
+    alert("売りシグナル確定", alert.freq_once_per_bar_close)

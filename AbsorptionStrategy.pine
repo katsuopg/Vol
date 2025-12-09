@@ -1,0 +1,248 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Vol Project
+
+//@version=6
+strategy(
+    title = "Absorption Strategy",
+    shorttitle = "AbsStrat",
+    overlay = true,
+    initial_capital = 1000000,
+    default_qty_type = strategy.percent_of_equity,
+    default_qty_value = 100,
+    commission_type = strategy.commission.percent,
+    commission_value = 0.1,
+    slippage = 1,
+    pyramiding = 0,
+    calc_on_every_tick = false,
+    max_labels_count = 500
+)
+
+// ————— Constants
+color BULL_ABS_COLOR = color.new(color.green, 0)
+color BEAR_ABS_COLOR = color.new(color.red, 0)
+color BULL_BREAKOUT_COLOR = color.new(color.lime, 0)
+color BEAR_BREAKOUT_COLOR = color.new(color.fuchsia, 0)
+float EPSILON = 1e-6
+
+// ————— Inputs: Backtest Settings
+string GROUP_BACKTEST = "バックテスト設定"
+string directionInput = input.string("Long Only", "Trade Direction", options = ["Long Only", "Short Only", "Both"], group = GROUP_BACKTEST)
+bool useDateFilterInput = input.bool(false, "Use Date Filter", group = GROUP_BACKTEST)
+int startYearInput = input.int(2020, "Start Year", minval = 2000, maxval = 2100, group = GROUP_BACKTEST)
+int startMonthInput = input.int(1, "Start Month", minval = 1, maxval = 12, group = GROUP_BACKTEST)
+int endYearInput = input.int(2025, "End Year", minval = 2000, maxval = 2100, group = GROUP_BACKTEST)
+int endMonthInput = input.int(12, "End Month", minval = 1, maxval = 12, group = GROUP_BACKTEST)
+
+string GROUP_RISK = "リスク管理"
+bool useStopLossInput = input.bool(true, "Use Stop Loss", group = GROUP_RISK)
+float stopLossAtrMultInput = input.float(2.0, "Stop Loss (ATR Mult)", minval = 0.5, step = 0.1, group = GROUP_RISK, tooltip = "ATRの何倍で損切り")
+bool useTakeProfitInput = input.bool(true, "Use Take Profit", group = GROUP_RISK)
+float takeProfitAtrMultInput = input.float(3.0, "Take Profit (ATR Mult)", minval = 0.5, step = 0.1, group = GROUP_RISK, tooltip = "ATRの何倍で利確")
+bool useTrailingStopInput = input.bool(false, "Use Trailing Stop", group = GROUP_RISK)
+float trailingStopAtrMultInput = input.float(1.5, "Trailing Stop (ATR Mult)", minval = 0.5, step = 0.1, group = GROUP_RISK)
+
+string GROUP_EXIT = "エグジット条件"
+bool exitOnReverseSignalInput = input.bool(true, "Exit on Reverse Signal", group = GROUP_EXIT, tooltip = "逆方向のシグナルでエグジット")
+bool exitOnTrendChangeInput = input.bool(false, "Exit on Trend Change", group = GROUP_EXIT, tooltip = "トレンド転換でエグジット")
+int maxHoldBarsInput = input.int(0, "Max Hold Bars (0=disabled)", minval = 0, group = GROUP_EXIT, tooltip = "最大保有バー数")
+
+// ————— Inputs: Signal Settings
+string GROUP_VOLUME = "出来高設定"
+float volSpikeMultInput = input.float(2.0, "Volume Spike Multiplier", minval = 1.0, step = 0.1, group = GROUP_VOLUME)
+int volSmaLengthInput = input.int(20, "Volume SMA Length", minval = 1, group = GROUP_VOLUME)
+
+string GROUP_PRICE = "価格設定"
+float atrMultInput = input.float(0.5, "ATR Multiplier for Flat", minval = 0.1, step = 0.1, group = GROUP_PRICE)
+int atrLengthInput = input.int(14, "ATR Length", minval = 1, group = GROUP_PRICE)
+
+string GROUP_FLOW = "フロー設定"
+float buyPressureRatioInput = input.float(1.3, "Buy Pressure Ratio", minval = 1.0, step = 0.1, group = GROUP_FLOW)
+
+string GROUP_TREND = "トレンドフィルター"
+bool useTrendFilterInput = input.bool(true, "Use Trend Filter", group = GROUP_TREND)
+int trendEmaLengthInput = input.int(50, "Trend EMA Length", minval = 1, group = GROUP_TREND)
+
+string GROUP_CONFIRM = "確認設定"
+bool useBreakoutConfirmInput = input.bool(true, "Require Breakout Confirm", group = GROUP_CONFIRM)
+int breakoutLookbackInput = input.int(5, "Breakout Lookback", minval = 1, maxval = 20, group = GROUP_CONFIRM)
+float breakoutAtrMultInput = input.float(1.0, "Breakout ATR Mult", minval = 0.5, step = 0.1, group = GROUP_CONFIRM)
+
+string GROUP_DISPLAY = "表示設定"
+bool showSignalsInput = input.bool(true, "Show Signals", group = GROUP_DISPLAY)
+bool showStatsInput = input.bool(true, "Show Stats Table", group = GROUP_DISPLAY)
+
+// ————— Functions
+estimateBuyVolume(float vol, float h, float l, float c) =>
+    float priceRange = h - l + EPSILON
+    float buyRatio = (c - l) / priceRange
+    vol * buyRatio
+
+// ————— Date Filter
+bool inDateRange = not useDateFilterInput or (time >= timestamp(startYearInput, startMonthInput, 1, 0, 0) and time < timestamp(endYearInput, endMonthInput + 1, 1, 0, 0))
+
+// ————— Calculations
+bool validBar = volume > 0
+float atrValue = ta.atr(atrLengthInput)
+
+// トレンド判定
+float trendEma = ta.ema(close, trendEmaLengthInput)
+bool upTrend = close > trendEma
+bool downTrend = close < trendEma
+
+// 出来高スパイク判定
+float volAvg = ta.sma(volume, volSmaLengthInput)
+bool volSpike = validBar and volume > volAvg * volSpikeMultInput
+
+// 価格横ばい判定（ATRベース）
+float priceChangeAbs = math.abs(close - open)
+bool priceFlat = priceChangeAbs < atrValue * atrMultInput
+
+// フロー優位性判定
+float buyVol = estimateBuyVolume(volume, high, low, close)
+float sellVol = volume - buyVol
+bool buyDominant = buyVol > sellVol * buyPressureRatioInput
+bool sellDominant = sellVol > buyVol * buyPressureRatioInput
+
+// 基本吸収条件
+bool baseBullAbsorption = volSpike and priceFlat and buyDominant
+bool baseBearAbsorption = volSpike and priceFlat and sellDominant
+
+// トレンドフィルター適用
+bool trendFilteredBull = useTrendFilterInput ? (baseBullAbsorption and upTrend) : baseBullAbsorption
+bool trendFilteredBear = useTrendFilterInput ? (baseBearAbsorption and downTrend) : baseBearAbsorption
+
+// 吸収状態の記録（ブレイクアウト検出用）
+var int barsSinceBullAbs = 999
+var int barsSinceBearAbs = 999
+
+if trendFilteredBull
+    barsSinceBullAbs := 0
+else
+    barsSinceBullAbs := barsSinceBullAbs + 1
+
+if trendFilteredBear
+    barsSinceBearAbs := 0
+else
+    barsSinceBearAbs := barsSinceBearAbs + 1
+
+// ブレイクアウト検出
+float breakoutThreshold = atrValue * breakoutAtrMultInput
+bool bullBreakout = close > open and (close - open) > breakoutThreshold
+bool bearBreakout = close < open and (open - close) > breakoutThreshold
+
+// 吸収後のブレイクアウト確認
+bool confirmedBullBreakout = bullBreakout and barsSinceBullAbs > 0 and barsSinceBullAbs <= breakoutLookbackInput
+bool confirmedBearBreakout = bearBreakout and barsSinceBearAbs > 0 and barsSinceBearAbs <= breakoutLookbackInput
+
+// 最終シグナル
+bool longSignal = useBreakoutConfirmInput ? confirmedBullBreakout : trendFilteredBull
+bool shortSignal = useBreakoutConfirmInput ? confirmedBearBreakout : trendFilteredBear
+
+// 方向フィルター
+bool allowLong = directionInput == "Long Only" or directionInput == "Both"
+bool allowShort = directionInput == "Short Only" or directionInput == "Both"
+
+// ————— Position Tracking
+var int barsInPosition = 0
+if strategy.position_size != 0
+    barsInPosition := barsInPosition + 1
+else
+    barsInPosition := 0
+
+// ————— Exit Conditions
+bool trendChangeExitLong = exitOnTrendChangeInput and strategy.position_size > 0 and downTrend
+bool trendChangeExitShort = exitOnTrendChangeInput and strategy.position_size < 0 and upTrend
+bool maxHoldExit = maxHoldBarsInput > 0 and barsInPosition >= maxHoldBarsInput
+bool reverseExitLong = exitOnReverseSignalInput and strategy.position_size > 0 and shortSignal
+bool reverseExitShort = exitOnReverseSignalInput and strategy.position_size < 0 and longSignal
+
+// ————— Strategy Calls
+// ロングエントリー
+if longSignal and allowLong and inDateRange and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+
+// ショートエントリー
+if shortSignal and allowShort and inDateRange and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+
+// SL/TP/Trailing設定
+float longStopPrice = useStopLossInput ? close - atrValue * stopLossAtrMultInput : na
+float longTakePrice = useTakeProfitInput ? close + atrValue * takeProfitAtrMultInput : na
+float shortStopPrice = useStopLossInput ? close + atrValue * stopLossAtrMultInput : na
+float shortTakePrice = useTakeProfitInput ? close - atrValue * takeProfitAtrMultInput : na
+float trailingOffset = useTrailingStopInput ? atrValue * trailingStopAtrMultInput : na
+
+if strategy.position_size > 0
+    strategy.exit("Long Exit", "Long", stop = longStopPrice, limit = longTakePrice, trail_offset = trailingOffset, trail_points = trailingOffset)
+
+if strategy.position_size < 0
+    strategy.exit("Short Exit", "Short", stop = shortStopPrice, limit = shortTakePrice, trail_offset = trailingOffset, trail_points = trailingOffset)
+
+// 条件付きエグジット
+if trendChangeExitLong or maxHoldExit or reverseExitLong
+    strategy.close("Long", comment = "Exit")
+
+if trendChangeExitShort or maxHoldExit or reverseExitShort
+    strategy.close("Short", comment = "Exit")
+
+// ————— Visuals
+plotshape(
+    showSignalsInput and longSignal and allowLong,
+    title = "Long Signal",
+    style = shape.triangleup,
+    location = location.belowbar,
+    color = BULL_BREAKOUT_COLOR,
+    size = size.small,
+    text = "L"
+)
+
+plotshape(
+    showSignalsInput and shortSignal and allowShort,
+    title = "Short Signal",
+    style = shape.triangledown,
+    location = location.abovebar,
+    color = BEAR_BREAKOUT_COLOR,
+    size = size.small,
+    text = "S"
+)
+
+plot(useTrendFilterInput ? trendEma : na, "Trend EMA", color = color.new(color.orange, 50), linewidth = 1)
+
+// 吸収ゾーン背景
+bgcolor(trendFilteredBull ? color.new(color.green, 90) : (trendFilteredBear ? color.new(color.red, 90) : na), title = "Absorption Zone")
+
+// ————— Stats Table
+var table statsTable = table.new(position.top_right, 2, 10, bgcolor = color.new(color.black, 80), frame_width = 1, frame_color = color.gray)
+
+if showStatsInput and barstate.islastconfirmedhistory
+    float winRate = strategy.wintrades / math.max(strategy.closedtrades, 1) * 100
+    float profitFactor = strategy.grossprofit / math.max(math.abs(strategy.grossloss), 1)
+    float avgWin = strategy.grossprofit / math.max(strategy.wintrades, 1)
+    float avgLoss = math.abs(strategy.grossloss) / math.max(strategy.losstrades, 1)
+    float expectancy = (winRate / 100 * avgWin) - ((100 - winRate) / 100 * avgLoss)
+
+    table.cell(statsTable, 0, 0, "総トレード", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 0, str.tostring(strategy.closedtrades), text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 0, 1, "勝率", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 1, str.tostring(winRate, "#.#") + "%", text_color = winRate >= 50 ? color.lime : color.red, text_size = size.small)
+    table.cell(statsTable, 0, 2, "PF", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 2, str.tostring(profitFactor, "#.##"), text_color = profitFactor >= 1 ? color.lime : color.red, text_size = size.small)
+    table.cell(statsTable, 0, 3, "純利益", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 3, str.tostring(strategy.netprofit, "#,###"), text_color = strategy.netprofit >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(statsTable, 0, 4, "最大DD", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 4, str.tostring(strategy.max_drawdown, "#,###"), text_color = color.orange, text_size = size.small)
+    table.cell(statsTable, 0, 5, "平均利益", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 5, str.tostring(avgWin, "#,###"), text_color = color.lime, text_size = size.small)
+    table.cell(statsTable, 0, 6, "平均損失", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 6, str.tostring(avgLoss, "#,###"), text_color = color.red, text_size = size.small)
+    table.cell(statsTable, 0, 7, "期待値", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 7, str.tostring(expectancy, "#,###"), text_color = expectancy >= 0 ? color.lime : color.red, text_size = size.small)
+    table.cell(statsTable, 0, 8, "勝ち", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 8, str.tostring(strategy.wintrades), text_color = color.lime, text_size = size.small)
+    table.cell(statsTable, 0, 9, "負け", text_color = color.white, text_size = size.small)
+    table.cell(statsTable, 1, 9, str.tostring(strategy.losstrades), text_color = color.red, text_size = size.small)
+
+// ————— Alerts
+alertcondition(longSignal, title = "Long Signal", message = "ロングシグナル: {{ticker}} {{interval}}")
+alertcondition(shortSignal, title = "Short Signal", message = "ショートシグナル: {{ticker}} {{interval}}")
